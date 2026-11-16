@@ -38,23 +38,51 @@ jobs:
           set -euo pipefail
           cd src
           XCPROJ=$(find . -maxdepth 4 -name "*.xcodeproj" -type d | head -1)
+          BASE=$(basename "$XCPROJ" .xcodeproj)
           LIST=$(xcodebuild -list -project "$XCPROJ" 2>&1 || true)
-          echo "$LIST" | head -40
-          SCHEME=$(echo "$LIST" | awk '/Schemes:/{f=1;next} f&&NF{print $1; exit}')
-          TARGET=$(echo "$LIST" | awk '/Targets:/{f=1;next} f&&NF{print $1; exit}')
+          echo "$LIST" | head -60
+          SCHEMES=$(echo "$LIST" | awk '/Schemes:/{f=1;next} f&&NF{print $1}')
+          echo "可用 scheme：$(echo $SCHEMES)"
           if echo "$LIST" | grep -qw Release; then
             CONFIG=Release
           else
             CONFIG=$(echo "$LIST" | awk '/Build Configurations:/{f=1;next} f&&NF{print $1; exit}')
           fi
           if [ -z "$CONFIG" ]; then CONFIG=Release; fi
-          echo "scheme=$SCHEME target=$TARGET config=$CONFIG"
+          # scheme 选择：优先取跟工程同名的（Unity 工程就是 Unity-iPhone），
+          # 否则会误选到 GameAssembly 这种库 target，编译直接 fail。
+          SCHEME=""
+          if echo "$SCHEMES" | grep -qx "$BASE"; then SCHEME="$BASE"; fi
+          if [ -z "$SCHEME" ]; then
+            if echo "$SCHEMES" | grep -qx "Unity-iPhone"; then SCHEME="Unity-iPhone"; fi
+          fi
+          APP_TARGET=""
+          if [ -z "$SCHEME" ]; then
+            APP_TARGET=$(python3 - "$XCPROJ/project.pbxproj" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding='utf-8', errors='ignore').read()
+for m in re.finditer(r'isa = PBXNativeTarget;.*?
+		\};', src, re.S):
+    b = m.group(0)
+    if 'com.apple.product-type.application' in b:
+        n = re.search(r'name = "?([^";
+]+)"?;', b)
+        if n:
+            print(n.group(1).strip())
+            break
+PY
+)
+            echo "app target=$APP_TARGET"
+          fi
           COMMON="CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= IPHONEOS_DEPLOYMENT_TARGET=15.0 ONLY_ACTIVE_ARCH=NO"
           if [ -n "$SCHEME" ]; then
             SELECT="-scheme $SCHEME"
+          elif [ -n "$APP_TARGET" ]; then
+            SELECT="-target $APP_TARGET"
           else
-            SELECT="-target $TARGET"
+            SELECT="-scheme $(echo "$SCHEMES" | head -1)"
           fi
+          echo "SELECT=$SELECT CONFIG=$CONFIG"
           set +e
           xcodebuild -project "$XCPROJ" $SELECT -configuration "$CONFIG" -sdk iphoneos             -destination 'generic/platform=iOS' -derivedDataPath build/derived             $COMMON build > build.log 2>&1
           RC=$?
