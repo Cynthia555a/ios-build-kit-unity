@@ -1,0 +1,103 @@
+name: Build Unity IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+jobs:
+  build-ipa:
+    name: build-ipa
+    runs-on: macos-latest
+    timeout-minutes: 150
+    steps:
+      - name: 机器信息
+        run: |
+          uname -a
+          sw_vers
+          xcodebuild -version
+      - name: 下载工程（Release 附件）
+        run: |
+          set -euo pipefail
+          TAG="src-pkg"
+          GH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          AURL=$(curl -sS -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json"             "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG"             | python3 -c 'import json,sys; d=json.load(sys.stdin); print([a["url"] for a in d["assets"] if a["name"]=="src.zip"][0])')
+          curl -fL --retry 3 -H "Authorization: token $GH_TOKEN"             -H "Accept: application/octet-stream" -o src.zip "$AURL"
+          ls -lh src.zip
+          mkdir -p src
+          unzip -q src.zip -d src
+      - name: 检查工程与工具链
+        run: |
+          set -euo pipefail
+          cd src
+          du -sh .
+          XCPROJ=$(find . -maxdepth 4 -name "*.xcodeproj" -type d | head -1)
+          echo "XCPROJ=$XCPROJ"
+          test -n "$XCPROJ"
+          xcodebuild -list -project "$XCPROJ" | head -40
+      - name: 编译（xcodebuild，先不签名）
+        run: |
+          set -euo pipefail
+          cd src
+          XCPROJ=$(find . -maxdepth 4 -name "*.xcodeproj" -type d | head -1)
+          LIST=$(xcodebuild -list -project "$XCPROJ" 2>&1 || true)
+          echo "$LIST" | head -40
+          SCHEME=$(echo "$LIST" | awk '/Schemes:/{f=1;next} f&&NF{print $1; exit}')
+          TARGET=$(echo "$LIST" | awk '/Targets:/{f=1;next} f&&NF{print $1; exit}')
+          if echo "$LIST" | grep -qw Release; then
+            CONFIG=Release
+          else
+            CONFIG=$(echo "$LIST" | awk '/Build Configurations:/{f=1;next} f&&NF{print $1; exit}')
+          fi
+          if [ -z "$CONFIG" ]; then CONFIG=Release; fi
+          echo "scheme=$SCHEME target=$TARGET config=$CONFIG"
+          COMMON="CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= IPHONEOS_DEPLOYMENT_TARGET=15.0 ONLY_ACTIVE_ARCH=NO"
+          if [ -n "$SCHEME" ]; then
+            SELECT="-scheme $SCHEME"
+          else
+            SELECT="-target $TARGET"
+          fi
+          set +e
+          xcodebuild -project "$XCPROJ" $SELECT -configuration "$CONFIG" -sdk iphoneos             -destination 'generic/platform=iOS' -derivedDataPath build/derived             $COMMON build > build.log 2>&1
+          RC=$?
+          set -e
+          echo "xcodebuild 退出码=$RC"
+          if [ $RC -ne 0 ]; then
+            echo "──── error 摘要 ────"
+            grep -n "error:" build.log | head -30 || true
+            echo "──── 日志末尾 120 行 ────"
+            tail -120 build.log
+            exit $RC
+          fi
+          tail -20 build.log
+      - name: ad-hoc 签名 + 打 ipa
+        run: |
+          set -euo pipefail
+          cd src
+          APP=$(find build/derived/Build/Products -maxdepth 2 -name "*.app" -type d | head -1)
+          echo "APP=$APP"
+          test -n "$APP"
+          du -sh "$APP"
+          EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" || true
+          echo "==> 先签内嵌 framework / dylib"
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -maxdepth 1 -name "*.framework" -type d | while read -r f; do
+              codesign --force --sign - "$f" || echo "   (框架签名失败，继续)"
+            done
+            find "$APP/Frameworks" -name "*.dylib" | while read -r f; do
+              codesign --force --sign - "$f" || true
+            done
+          fi
+          echo "==> 再签主程序"
+          codesign --force --sign - "$APP" || echo "   主程序签名失败"
+          codesign -dv "$APP" 2>&1 | head -6 || true
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry IPA.ipa Payload
+          ls -lh IPA.ipa
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPA
+          path: src/out/IPA.ipa
+          if-no-files-found: error
