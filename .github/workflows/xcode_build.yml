@@ -19,8 +19,11 @@ jobs:
           set -euo pipefail
           TAG="src-pkg"
           GH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          AURL=$(curl -sS -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json"             "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG"             | python3 -c 'import json,sys; d=json.load(sys.stdin); print([a["url"] for a in d["assets"] if a["name"]=="src.zip"][0])')
-          curl -fL --retry 3 -H "Authorization: token $GH_TOKEN"             -H "Accept: application/octet-stream" -o src.zip "$AURL"
+          AURL=$(curl -sS -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print([a["url"] for a in d["assets"] if a["name"]=="src.zip"][0])')
+          curl -fL --retry 3 -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/octet-stream" -o src.zip "$AURL"
           ls -lh src.zip
           mkdir -p src
           unzip -q src.zip -d src
@@ -58,20 +61,20 @@ jobs:
           fi
           APP_TARGET=""
           if [ -z "$SCHEME" ]; then
-            APP_TARGET=$(python3 - "$XCPROJ/project.pbxproj" <<'PY'
-import re, sys
-src = open(sys.argv[1], encoding='utf-8', errors='ignore').read()
-for m in re.finditer(r'isa = PBXNativeTarget;.*?
-		\};', src, re.S):
-    b = m.group(0)
-    if 'com.apple.product-type.application' in b:
-        n = re.search(r'name = "?([^";
-]+)"?;', b)
-        if n:
-            print(n.group(1).strip())
-            break
-PY
-)
+            APP_TARGET=$(awk '
+              /isa = PBXNativeTarget;/ { inb=1; has=0; nm="" }
+              inb && /name = / {
+                line=$0
+                sub(/^.*name = /, "", line)
+                sub(/;.*$/, "", line)
+                gsub(/"/, "", line)
+                gsub(/^ +/, "", line)
+                gsub(/ +$/, "", line)
+                nm=line
+              }
+              inb && /com.apple.product-type.application/ { has=1 }
+              inb && /};/ { if (has && nm!="") { print nm; exit }; inb=0 }
+            ' "$XCPROJ/project.pbxproj")
             echo "app target=$APP_TARGET"
           fi
           COMMON="CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= IPHONEOS_DEPLOYMENT_TARGET=15.0 ONLY_ACTIVE_ARCH=NO"
@@ -84,7 +87,9 @@ PY
           fi
           echo "SELECT=$SELECT CONFIG=$CONFIG"
           set +e
-          xcodebuild -project "$XCPROJ" $SELECT -configuration "$CONFIG" -sdk iphoneos             -destination 'generic/platform=iOS' -derivedDataPath build/derived             $COMMON build > build.log 2>&1
+          xcodebuild -project "$XCPROJ" $SELECT -configuration "$CONFIG" -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath build/derived \
+            $COMMON build > build.log 2>&1
           RC=$?
           set -e
           echo "xcodebuild 退出码=$RC"
